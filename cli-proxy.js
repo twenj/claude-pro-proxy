@@ -15,10 +15,10 @@ app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ limit: '100mb', extended: true }));
 
 const AVAILABLE_MODELS = [
+  { id: 'claude-fable-5', object: 'model', created: 1718000000, owned_by: 'anthropic' },
   { id: 'claude-pro', object: 'model', created: 1718000000, owned_by: 'anthropic' },
   { id: 'claude-opus-4-8', object: 'model', created: 1718000000, owned_by: 'anthropic' },
   { id: 'claude-sonnet-4-6', object: 'model', created: 1718000000, owned_by: 'anthropic' },
-  { id: 'claude-4-6-sonnet', object: 'model', created: 1718000000, owned_by: 'anthropic' },
 ];
 
 function mapModel(model) {
@@ -587,9 +587,6 @@ app.post('/v1/chat/completions', async (req, res) => {
           });
         }
       });
-
-      child.stdin.write(prompt);
-      child.stdin.end();
     }
   } catch (error) {
     console.error('Error:', error);
@@ -603,7 +600,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', message: 'Claude CLI proxy is running' });
+  res.json({ status: 'ok', message: 'Claude CLI proxy is running', default_model: DEFAULT_MODEL, available_models: AVAILABLE_MODELS.map(model => model.id) });
 });
 
 app.listen(PORT, () => {
