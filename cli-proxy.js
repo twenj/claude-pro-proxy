@@ -189,7 +189,14 @@ function extractToolCalls(text) {
       if (parsed.tool_calls && Array.isArray(parsed.tool_calls)) {
         for (const tc of parsed.tool_calls) {
           toolCalls.push({
-            id: tc.id || `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+            // The model is asked to invent its own id, but it isn't asked
+            // (or reliable) about uniqueness - it commonly reuses the same
+            // placeholder (e.g. "call_001") across unrelated calls in the
+            // same conversation. A real API always hands out globally
+            // unique ids, and clients may rely on that to correlate a call
+            // with its eventual result, so we always mint our own instead
+            // of trusting the model's.
+            id: `call_${crypto.randomUUID()}`,
             type: 'function',
             function: {
               name: tc.name || '',
@@ -355,8 +362,27 @@ const SESSION_TTL_MS = 6 * 60 * 60 * 1000;
 const sessionStore = new Map(); // hash(prefix) -> { sessionId, lastUsed }
 const sessionsInFlight = new Set(); // sessionId currently mid-request
 
+// Reduce a message to only the fields that matter for matching, in a fixed
+// key order. Different clients reconstruct message objects differently
+// (field order, extra provider-specific fields like `refusal` or
+// `annotations`) - hashing the raw object would make the hash sensitive to
+// those irrelevant differences and silently defeat resume on every turn for
+// any client that doesn't echo our exact object shape back byte-for-byte.
+function canonicalizeMessage(msg) {
+  const canonical = { role: msg.role, content: msg.content ?? null };
+  if (msg.tool_call_id !== undefined) canonical.tool_call_id = msg.tool_call_id;
+  if (Array.isArray(msg.tool_calls)) {
+    canonical.tool_calls = msg.tool_calls.map(tc => ({
+      id: tc.id,
+      name: tc.function?.name ?? tc.name,
+      arguments: tc.function?.arguments ?? tc.arguments,
+    }));
+  }
+  return canonical;
+}
+
 function hashMessages(msgs) {
-  return crypto.createHash('sha256').update(JSON.stringify(msgs)).digest('hex');
+  return crypto.createHash('sha256').update(JSON.stringify(msgs.map(canonicalizeMessage))).digest('hex');
 }
 
 function pruneSessionStore() {
