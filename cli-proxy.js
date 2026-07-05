@@ -30,6 +30,38 @@ const AVAILABLE_MODELS = [
   { id: 'claude-sonnet-4-6', object: 'model', created: 1718000000, owned_by: 'anthropic' },
 ];
 
+const ASK_USER_TOOL = {
+  type: 'function',
+  function: {
+    name: 'ask_user_question',
+    description: 'Ask the user a blocking clarification question and present selectable options.',
+    parameters: {
+      type: 'object',
+      properties: {
+        question: {
+          type: 'string',
+          description: 'A concise question for the user.',
+        },
+        options: {
+          type: 'array',
+          description: 'Two to four short, mutually exclusive choices.',
+          minItems: 2,
+          maxItems: 4,
+          items: {
+            type: 'object',
+            properties: {
+              label: { type: 'string', description: 'Short option label.' },
+              description: { type: 'string', description: 'What selecting this option means.' },
+            },
+            required: ['label'],
+          },
+        },
+      },
+      required: ['question', 'options'],
+    },
+  },
+};
+
 function mapModel(model) {
   const modelMap = {
     'gpt-4': 'claude-opus-4-8',
@@ -98,12 +130,15 @@ function contentToString(content) {
   return String(content || '');
 }
 
-function buildToolsPrompt(tools) {
-  if (!tools || tools.length === 0) return '';
+function buildToolsPrompt(tools = []) {
+  const availableTools = [
+    ASK_USER_TOOL,
+    ...tools.filter(tool => tool?.function?.name !== ASK_USER_TOOL.function.name),
+  ];
 
   let prompt = '你可以调用以下工具来完成任务：\n\n';
 
-  for (const tool of tools) {
+  for (const tool of availableTools) {
     if (tool.type === 'function' && tool.function) {
       const fn = tool.function;
       prompt += `工具名称: ${fn.name}\n`;
@@ -115,7 +150,9 @@ function buildToolsPrompt(tools) {
     }
   }
 
-  prompt += `当你需要调用工具时，严格使用以下格式输出（不要有其他内容）：
+  prompt += `如果缺少完成任务所必需的信息，并且适合让用户从有限选项中选择，请调用 ask_user_question。不要自行猜测，也不要把选择题作为普通文本输出。
+
+当你需要调用工具时，严格使用以下格式输出（不要有其他内容）：
 \`\`\`json
 {
   "tool_calls": [
@@ -292,8 +329,6 @@ app.post('/v1/chat/completions', validateChatRequest, async (req, res) => {
     }
 
     const cliModel = mapModel(model);
-    const hasExternalTools = tools && tools.length > 0;
-
     const args = ['-p', '--safe-mode', '--model', cliModel];
 
     if (hasImages) {
@@ -337,7 +372,7 @@ app.post('/v1/chat/completions', validateChatRequest, async (req, res) => {
         streamFinished = true;
 
         const rawText = fullText || '';
-        const toolCalls = hasExternalTools ? extractToolCalls(rawText) : [];
+        const toolCalls = extractToolCalls(rawText);
         const cleanText = toolCalls.length ? stripToolCallBlocks(rawText) : rawText;
         const delta = { role: 'assistant' };
 
@@ -606,7 +641,7 @@ app.post('/v1/chat/completions', validateChatRequest, async (req, res) => {
 
         try {
           const rawText = fullText || '';
-          const toolCalls = hasExternalTools ? extractToolCalls(rawText) : [];
+          const toolCalls = extractToolCalls(rawText);
 
           let message;
           let finishReason;
@@ -675,9 +710,13 @@ app.get('/health', (req, res) => {
 
 installErrorHandler(app);
 
-app.listen(PORT, () => {
-  console.log(`Claude CLI proxy server running on http://localhost:${PORT}`);
-  console.log(`Default model: ${DEFAULT_MODEL}`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
-  console.log(`Uses Claude Code CLI (Pro subscription credits)`);
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Claude CLI proxy server running on http://localhost:${PORT}`);
+    console.log(`Default model: ${DEFAULT_MODEL}`);
+    console.log(`Health check: http://localhost:${PORT}/health`);
+    console.log(`Uses Claude Code CLI (Pro subscription credits)`);
+  });
+}
+
+module.exports = { app, buildToolsPrompt, extractToolCalls };
