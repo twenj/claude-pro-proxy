@@ -19,6 +19,8 @@ npm run start:cli
 
 The CLI mode uses the local Claude login. OpenAI tool calls are emulated through structured prompting because Claude CLI does not accept external function schemas as native tools. Built-in CLI tools are disabled, except read-only access to temporary uploaded image files.
 
+With `stream: true`, plain-text replies are forwarded to the client as they arrive. A reply is held back and buffered only while it still looks like it could turn into a ` ```json {"tool_calls": ...} ``` ` block, so structured tool calls are never leaked to the client as partial JSON.
+
 ### User clarification tool
 
 CLI mode exposes a proxy-level OpenAI function named `ask_user_question`. When Claude needs a blocking choice, the response has `finish_reason: "tool_calls"` and arguments shaped like:
@@ -43,5 +45,6 @@ The frontend should render these options and send the selected value in the next
 - `ALLOWED_ORIGINS`: comma-separated CORS allowlist; empty allows all origins
 - `BODY_LIMIT`: Express request limit, default `10mb`
 - `CLAUDE_BIN`: Claude executable path for CLI mode
+- `CLI_TIMEOUT_MS`: CLI mode only; kills the Claude CLI process if it hasn't finished within this many milliseconds (default `120000`)
 
 Do not expose the service publicly without setting `PROXY_API_KEY` and `ALLOWED_ORIGINS`.

@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { spawn } = require('child_process');
+const { EventEmitter } = require('events');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -17,6 +18,7 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'claude-sonnet-4-6';
 const CLAUDE_BIN = process.env.CLAUDE_BIN || path.join(os.homedir(), '.local', 'bin', 'claude');
+const CLI_TIMEOUT_MS = Number(process.env.CLI_TIMEOUT_MS) || 120000;
 
 app.use(cors(corsOptions()));
 app.use(express.json({ limit: DEFAULT_BODY_LIMIT }));
@@ -221,6 +223,21 @@ function stripToolCallBlocks(text) {
   return result.trim();
 }
 
+// A response can only be classified once we've seen enough of its prefix:
+// a lone leading backtick is ambiguous (could be inline code or the start of
+// a ```json tool-call block), so we wait for up to 3 characters before deciding.
+function classifyResponsePrefix(text) {
+  const trimmed = text.replace(/^\s+/, '');
+  if (!trimmed) return 'undecided';
+  const firstChar = trimmed[0];
+  if (firstChar === '{') return 'tool-call-like';
+  if (firstChar === '`') {
+    if (trimmed.length < 3) return 'undecided';
+    return trimmed.startsWith('```') ? 'tool-call-like' : 'plain-text';
+  }
+  return 'plain-text';
+}
+
 function extractToolResults(messages) {
   const results = [];
   for (const msg of messages) {
@@ -297,6 +314,121 @@ function cleanupTempDir(dir) {
   }
 }
 
+// Spawns the Claude CLI and turns its stream-json stdout into a small set of
+// events, shared by both the streaming and non-streaming response paths.
+//
+// Events:
+//   'text'        (delta: string)                 incremental assistant text
+//   'stop'        (state)                          CLI reported message_stop
+//   'cli-error'   (message: string)                CLI emitted a `type: error` line
+//   'spawn-error' (error: Error)                    the CLI process failed to start
+//   'close'       ({ code, timedOut, state })       the CLI process exited
+function runClaudeCli(args, prompt) {
+  const emitter = new EventEmitter();
+  const child = spawn(CLAUDE_BIN, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+
+  const state = {
+    fullText: '',
+    promptTokens: 0,
+    completionTokens: 0,
+    stopReason: 'stop',
+    stderr: '',
+  };
+
+  let buffer = '';
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    child.kill('SIGTERM');
+  }, CLI_TIMEOUT_MS);
+
+  child.stdout.on('data', (data) => {
+    buffer += data.toString();
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+
+      let parsed;
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch (e) {
+        console.error('Parse error:', e.message, 'Line:', trimmed.substring(0, 100));
+        continue;
+      }
+
+      if (parsed.type === 'stream_event' && parsed.event) {
+        const event = parsed.event;
+
+        if (event.type === 'content_block_delta' && typeof event.delta?.text === 'string') {
+          state.fullText += event.delta.text;
+          emitter.emit('text', event.delta.text);
+        }
+
+        if (event.type === 'message_delta' && event.usage) {
+          state.promptTokens = event.usage.input_tokens || 0;
+          state.completionTokens = event.usage.output_tokens || 0;
+          if (event.stop_reason) {
+            state.stopReason = event.stop_reason === 'end_turn' ? 'stop' : event.stop_reason;
+          }
+        }
+
+        if (event.type === 'message_stop') {
+          emitter.emit('stop', state);
+        }
+      }
+
+      if (parsed.type === 'result') {
+        if (!state.fullText && typeof parsed.result === 'string') {
+          state.fullText = parsed.result;
+          emitter.emit('text', state.fullText);
+        }
+        if (parsed.usage) {
+          state.promptTokens = parsed.usage.input_tokens || state.promptTokens;
+          state.completionTokens = parsed.usage.output_tokens || state.completionTokens;
+        }
+      }
+
+      if (parsed.type === 'error') {
+        console.error('CLI error event:', JSON.stringify(parsed));
+        let errorMsg = 'Internal server error';
+        if (typeof parsed.error === 'string') {
+          errorMsg = parsed.error;
+        } else if (parsed.error && typeof parsed.error.message === 'string') {
+          errorMsg = parsed.error.message;
+        }
+        emitter.emit('cli-error', errorMsg);
+      }
+    }
+  });
+
+  child.stderr.on('data', (data) => {
+    state.stderr += data.toString();
+    console.error('CLI stderr:', data.toString());
+  });
+
+  child.on('error', (error) => {
+    clearTimeout(timer);
+    emitter.emit('spawn-error', error);
+  });
+
+  child.on('close', (code) => {
+    clearTimeout(timer);
+    emitter.emit('close', { code, timedOut, state });
+  });
+
+  child.stdin.write(prompt);
+  child.stdin.end();
+
+  emitter.kill = () => {
+    if (child.exitCode === null) child.kill('SIGTERM');
+  };
+
+  return emitter;
+}
+
 app.get('/v1/models', (req, res) => {
   res.json({
     object: 'list',
@@ -305,6 +437,7 @@ app.get('/v1/models', (req, res) => {
 });
 
 app.post('/v1/chat/completions', validateChatRequest, async (req, res) => {
+  let tempDir;
   try {
     const { messages, model, stream = false, temperature, max_tokens, tools } = req.body;
 
@@ -318,7 +451,8 @@ app.post('/v1/chat/completions', validateChatRequest, async (req, res) => {
     if (toolsPrompt) systemPromptParts.push(toolsPrompt);
     const systemPrompt = systemPromptParts.length > 0 ? systemPromptParts.join('\n\n') : undefined;
 
-    const { images, tempDir } = extractAndSaveImages(messages);
+    const { images, tempDir: dir } = extractAndSaveImages(messages);
+    tempDir = dir;
     const hasImages = images.length > 0;
 
     const conversationMessages = messages.filter(m => m.role === 'user' || m.role === 'assistant');
@@ -340,7 +474,11 @@ app.post('/v1/chat/completions', validateChatRequest, async (req, res) => {
     }
 
     if (systemPrompt) {
-      args.push('--system-prompt', systemPrompt);
+      // Passed via a file rather than argv: tool schemas can make this large
+      // enough to risk hitting the OS's argv size limit (E2BIG).
+      const systemPromptPath = path.join(tempDir, 'system-prompt.txt');
+      fs.writeFileSync(systemPromptPath, systemPrompt);
+      args.push('--system-prompt-file', systemPromptPath);
     }
 
     args.push('--output-format', 'stream-json');
@@ -352,355 +490,201 @@ app.post('/v1/chat/completions', validateChatRequest, async (req, res) => {
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
 
-      const child = spawn(CLAUDE_BIN, args, {
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
-
-      let buffer = '';
-      let fullText = '';
-      let promptTokens = 0;
-      let completionTokens = 0;
-      let totalCost = 0;
+      const cli = runClaudeCli(args, prompt);
+      const responseId = 'chatcmpl-' + Date.now();
+      let disconnected = false;
       let streamFinished = false;
+      let roleSent = false;
 
       res.on('close', () => {
-        if (!res.writableEnded && child.exitCode === null) child.kill('SIGTERM');
+        if (!res.writableEnded) {
+          disconnected = true;
+          cli.kill();
+        }
       });
 
-      const finishStream = () => {
-        if (streamFinished || res.writableEnded) return;
-        streamFinished = true;
-
-        const rawText = fullText || '';
-        const toolCalls = extractToolCalls(rawText);
-        const cleanText = toolCalls.length ? stripToolCallBlocks(rawText) : rawText;
-        const delta = { role: 'assistant' };
-
-        if (cleanText) delta.content = cleanText;
-        if (toolCalls.length) {
-          delta.tool_calls = toolCalls.map((call, index) => ({ index, ...call }));
+      const writeChunk = (delta, finishReason = null, usage = null) => {
+        if (disconnected || res.writableEnded) return;
+        if (Object.keys(delta).length && !roleSent) {
+          delta = { role: 'assistant', ...delta };
+          roleSent = true;
         }
-
-        if (cleanText || toolCalls.length) {
-          res.write(`data: ${JSON.stringify({
-            id: 'chatcmpl-' + Date.now(),
-            object: 'chat.completion.chunk',
-            created: Math.floor(Date.now() / 1000),
-            model: cliModel,
-            choices: [{ index: 0, delta, finish_reason: null }],
-          })}\n\n`);
-        }
-
-        res.write(`data: ${JSON.stringify({
-          id: 'chatcmpl-' + Date.now(),
+        const chunk = {
+          id: responseId,
           object: 'chat.completion.chunk',
           created: Math.floor(Date.now() / 1000),
           model: cliModel,
-          choices: [{
-            index: 0,
-            delta: {},
-            finish_reason: toolCalls.length ? 'tool_calls' : 'stop',
-          }],
-          usage: {
-            prompt_tokens: promptTokens,
-            completion_tokens: completionTokens,
-            total_tokens: promptTokens + completionTokens,
-          },
-        })}\n\n`);
+          choices: [{ index: 0, delta, finish_reason: finishReason }],
+        };
+        if (usage) chunk.usage = usage;
+        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+      };
+
+      // Text can only be forwarded live once we're confident it isn't the
+      // start of a ```json tool-call block (see classifyResponsePrefix).
+      // Until that's decided, deltas are held in `pending` instead of sent.
+      let mode = 'undecided';
+      let pending = '';
+
+      cli.on('text', (delta) => {
+        if (disconnected || res.writableEnded) return;
+
+        if (mode === 'passthrough') {
+          writeChunk({ content: delta });
+          return;
+        }
+        if (mode === 'buffering') return;
+
+        pending += delta;
+        const verdict = classifyResponsePrefix(pending);
+        if (verdict === 'undecided') return;
+        if (verdict === 'tool-call-like') {
+          mode = 'buffering';
+          return;
+        }
+
+        mode = 'passthrough';
+        writeChunk({ content: pending });
+        pending = '';
+      });
+
+      const finish = ({ fullText, promptTokens, completionTokens }) => {
+        if (streamFinished || res.writableEnded) return;
+        streamFinished = true;
+
+        // If we were already streaming plain text live, it's all been sent -
+        // re-sending the accumulated fullText here would duplicate it.
+        const rawText = fullText || '';
+        const toolCalls = mode === 'passthrough' ? [] : extractToolCalls(rawText);
+        const cleanText = toolCalls.length ? stripToolCallBlocks(rawText) : rawText;
+
+        if (mode !== 'passthrough' && (cleanText || toolCalls.length)) {
+          const delta = {};
+          if (cleanText) delta.content = cleanText;
+          if (toolCalls.length) delta.tool_calls = toolCalls.map((call, index) => ({ index, ...call }));
+          writeChunk(delta);
+        }
+
+        writeChunk({}, toolCalls.length ? 'tool_calls' : 'stop', {
+          prompt_tokens: promptTokens,
+          completion_tokens: completionTokens,
+          total_tokens: promptTokens + completionTokens,
+        });
         res.write('data: [DONE]\n\n');
         res.end();
       };
 
-      child.stdout.on('data', (data) => {
-        buffer += data.toString();
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
+      cli.on('stop', (state) => finish(state));
 
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
-
-          try {
-            const parsed = JSON.parse(trimmed);
-
-            if (parsed.type === 'stream_event' && parsed.event) {
-              const event = parsed.event;
-
-              if (event.type === 'content_block_delta' && event.delta) {
-                let text = '';
-                if (event.delta.type === 'text_delta' && typeof event.delta.text === 'string') {
-                  text = event.delta.text;
-                } else if (typeof event.delta.text === 'string') {
-                  text = event.delta.text;
-                }
-
-                if (text) {
-                  fullText += text;
-                }
-              }
-
-              if (event.type === 'message_delta' && event.usage) {
-                promptTokens = event.usage.input_tokens || 0;
-                completionTokens = event.usage.output_tokens || 0;
-                if (event.usage.cost) {
-                  totalCost = event.usage.cost;
-                }
-              }
-
-              if (event.type === 'message_stop') {
-                finishStream();
-              }
-            }
-
-            if (parsed.type === 'result') {
-              if (!fullText && parsed.result) {
-                if (typeof parsed.result === 'string') {
-                  fullText = parsed.result;
-                }
-              }
-              if (parsed.usage) {
-                promptTokens = parsed.usage.input_tokens || promptTokens;
-                completionTokens = parsed.usage.output_tokens || completionTokens;
-              }
-              if (parsed.total_cost_usd) {
-                totalCost = parsed.total_cost_usd;
-              }
-            }
-
-            if (parsed.type === 'error') {
-              console.error('CLI error event:', JSON.stringify(parsed));
-              let errorMsg = 'Internal server error';
-              if (typeof parsed.error === 'string') {
-                errorMsg = parsed.error;
-              } else if (parsed.error && typeof parsed.error.message === 'string') {
-                errorMsg = parsed.error.message;
-              }
-              const errorChunk = {
-                error: {
-                  message: errorMsg,
-                  type: 'api_error',
-                },
-              };
-              const errorStr = `data: ${JSON.stringify(errorChunk)}\n\n`;
-              if (typeof errorStr === 'string') {
-                res.write(errorStr);
-              }
-              res.end();
-            }
-          } catch (e) {
-            console.error('Parse error:', e.message, 'Line:', trimmed.substring(0, 100));
-          }
-        }
+      cli.on('cli-error', (message) => {
+        if (streamFinished || res.writableEnded) return;
+        streamFinished = true;
+        res.write(`data: ${JSON.stringify({ error: { message, type: 'api_error' } })}\n\n`);
+        res.end();
       });
 
-      child.stderr.on('data', (data) => {
-        console.error('CLI stderr:', data.toString());
-      });
-
-      child.on('error', (error) => {
+      cli.on('spawn-error', (error) => {
         cleanupTempDir(tempDir);
-        if (res.writableEnded) return;
+        if (streamFinished || res.writableEnded) return;
         streamFinished = true;
         console.error('Failed to start Claude CLI:', error);
         res.write(`data: ${JSON.stringify({
-          error: {
-            message: `Failed to start Claude CLI: ${error.message}`,
-            type: 'api_error',
-          },
+          error: { message: `Failed to start Claude CLI: ${error.message}`, type: 'api_error' },
         })}\n\n`);
         res.end();
       });
 
-      child.on('close', (code) => {
+      cli.on('close', ({ code, timedOut, state }) => {
         cleanupTempDir(tempDir);
-        if (code !== 0 && !res.writableEnded && !fullText) {
-          console.error(`CLI process exited with code ${code}`);
-          const errorChunk = {
-            error: {
-              message: `CLI process exited with code ${code}`,
-              type: 'api_error',
-            },
-          };
-          res.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
+        if (streamFinished || res.writableEnded) return;
+        if (code !== 0 && !state.fullText) {
+          streamFinished = true;
+          const message = timedOut
+            ? `CLI process timed out after ${CLI_TIMEOUT_MS}ms`
+            : `CLI process exited with code ${code}`;
+          console.error(message);
+          res.write(`data: ${JSON.stringify({ error: { message, type: 'api_error' } })}\n\n`);
           res.end();
-        } else if (!res.writableEnded) {
-          finishStream();
+        } else {
+          finish(state);
         }
       });
-
-      child.stdin.write(prompt);
-      child.stdin.end();
 
     } else {
-      const child = spawn(CLAUDE_BIN, args, {
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
-
-      let buffer = '';
-      let fullText = '';
-      let promptTokens = 0;
-      let completionTokens = 0;
-      let totalCost = 0;
-      let stopReason = 'stop';
-      let stderr = '';
+      const cli = runClaudeCli(args, prompt);
+      let responded = false;
 
       res.on('close', () => {
-        if (!res.writableEnded && child.exitCode === null) child.kill('SIGTERM');
+        if (!res.writableEnded && !responded) cli.kill();
       });
 
-      child.stdout.on('data', (data) => {
-        buffer += data.toString();
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
+      const respondError = (status, message) => {
+        if (responded || res.headersSent) return;
+        responded = true;
+        res.status(status).json({ error: { message, type: 'api_error' } });
+      };
 
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
-
-          try {
-            const parsed = JSON.parse(trimmed);
-
-            if (parsed.type === 'stream_event' && parsed.event) {
-              const event = parsed.event;
-
-              if (event.type === 'content_block_delta' && event.delta) {
-                let text = '';
-                if (event.delta.type === 'text_delta' && typeof event.delta.text === 'string') {
-                  text = event.delta.text;
-                } else if (typeof event.delta.text === 'string') {
-                  text = event.delta.text;
-                }
-
-                if (text) {
-                  fullText += text;
-                }
-              }
-
-              if (event.type === 'message_delta' && event.usage) {
-                promptTokens = event.usage.input_tokens || 0;
-                completionTokens = event.usage.output_tokens || 0;
-                if (event.usage.cost) {
-                  totalCost = event.usage.cost;
-                }
-                if (event.stop_reason) {
-                  stopReason = event.stop_reason === 'end_turn' ? 'stop' : event.stop_reason;
-                }
-              }
-            }
-
-            if (parsed.type === 'result') {
-              if (!fullText && parsed.result) {
-                if (typeof parsed.result === 'string') {
-                  fullText = parsed.result;
-                }
-              }
-              if (parsed.usage) {
-                promptTokens = parsed.usage.input_tokens || promptTokens;
-                completionTokens = parsed.usage.output_tokens || completionTokens;
-              }
-              if (parsed.total_cost_usd) {
-                totalCost = parsed.total_cost_usd;
-              }
-            }
-          } catch (e) {
-          }
-        }
+      cli.on('cli-error', (message) => {
+        respondError(500, message);
       });
 
-      child.stderr.on('data', (data) => {
-        stderr += data.toString();
-        console.error('CLI stderr:', data.toString());
-      });
-
-      child.on('error', (error) => {
+      cli.on('spawn-error', (error) => {
         cleanupTempDir(tempDir);
-        if (res.headersSent) return res.end();
         console.error('Failed to start Claude CLI:', error);
-        res.status(500).json({
-          error: {
-            message: `Failed to start Claude CLI: ${error.message}`,
-            type: 'api_error',
+        respondError(500, `Failed to start Claude CLI: ${error.message}`);
+      });
+
+      cli.on('close', ({ code, timedOut, state }) => {
+        cleanupTempDir(tempDir);
+        if (responded) return;
+
+        if (code !== 0 && !state.fullText) {
+          const message = timedOut
+            ? `CLI process timed out after ${CLI_TIMEOUT_MS}ms`
+            : (state.stderr || `CLI exited with code ${code}`);
+          console.error('CLI exited with code', code, 'stderr:', state.stderr);
+          return respondError(500, message);
+        }
+
+        const rawText = state.fullText || '';
+        const toolCalls = extractToolCalls(rawText);
+
+        let message;
+        let finishReason;
+        if (toolCalls.length > 0) {
+          message = { role: 'assistant', content: stripToolCallBlocks(rawText) || null, tool_calls: toolCalls };
+          finishReason = 'tool_calls';
+        } else {
+          message = { role: 'assistant', content: rawText };
+          finishReason = state.stopReason;
+        }
+
+        responded = true;
+        res.json({
+          id: 'chatcmpl-' + Date.now(),
+          object: 'chat.completion',
+          created: Math.floor(Date.now() / 1000),
+          model: cliModel,
+          choices: [{ index: 0, message, finish_reason: finishReason }],
+          usage: {
+            prompt_tokens: state.promptTokens,
+            completion_tokens: state.completionTokens,
+            total_tokens: state.promptTokens + state.completionTokens,
           },
         });
       });
-
-      child.stdin.write(prompt);
-      child.stdin.end();
-
-      child.on('close', (code) => {
-        cleanupTempDir(tempDir);
-        if (code !== 0 && !fullText) {
-          console.error('CLI exited with code', code, 'stderr:', stderr);
-          return res.status(500).json({
-            error: {
-              message: stderr || `CLI exited with code ${code}`,
-              type: 'api_error',
-            },
-          });
-        }
-
-        try {
-          const rawText = fullText || '';
-          const toolCalls = extractToolCalls(rawText);
-
-          let message;
-          let finishReason;
-
-          if (toolCalls.length > 0) {
-            const cleanText = stripToolCallBlocks(rawText);
-            message = {
-              role: 'assistant',
-              content: cleanText || null,
-              tool_calls: toolCalls,
-            };
-            finishReason = 'tool_calls';
-          } else {
-            message = {
-              role: 'assistant',
-              content: rawText,
-            };
-            finishReason = stopReason;
-          }
-
-          const openAIResponse = {
-            id: 'chatcmpl-' + Date.now(),
-            object: 'chat.completion',
-            created: Math.floor(Date.now() / 1000),
-            model: cliModel,
-            choices: [
-              {
-                index: 0,
-                message: message,
-                finish_reason: finishReason,
-              },
-            ],
-            usage: {
-              prompt_tokens: promptTokens,
-              completion_tokens: completionTokens,
-              total_tokens: promptTokens + completionTokens,
-            },
-          };
-
-          res.json(openAIResponse);
-        } catch (error) {
-          console.error('Parse error:', error);
-          res.status(500).json({
-            error: {
-              message: error.message || 'Internal server error',
-              type: 'api_error',
-            },
-          });
-        }
-      });
     }
   } catch (error) {
+    cleanupTempDir(tempDir);
     console.error('Error:', error);
-    res.status(500).json({
-      error: {
-        message: error.message || 'Internal server error',
-        type: 'api_error',
-      },
-    });
+    if (!res.headersSent) {
+      res.status(500).json({
+        error: {
+          message: error.message || 'Internal server error',
+          type: 'api_error',
+        },
+      });
+    }
   }
 });
 
