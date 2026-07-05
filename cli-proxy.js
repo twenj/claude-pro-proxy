@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const { spawn } = require('child_process');
 const { EventEmitter } = require('events');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -19,6 +20,7 @@ const PORT = process.env.PORT || 3001;
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'claude-sonnet-4-6';
 const CLAUDE_BIN = process.env.CLAUDE_BIN || path.join(os.homedir(), '.local', 'bin', 'claude');
 const CLI_TIMEOUT_MS = Number(process.env.CLI_TIMEOUT_MS) || 120000;
+const DEFAULT_SYSTEM_PROMPT = 'You are a helpful assistant.';
 
 app.use(cors(corsOptions()));
 app.use(express.json({ limit: DEFAULT_BODY_LIMIT }));
@@ -133,6 +135,10 @@ function contentToString(content) {
 }
 
 function buildToolsPrompt(tools = []) {
+  // Skip the whole block for tool-less requests instead of always paying for
+  // the ask_user_question boilerplate on every plain chat completion.
+  if (!tools.length) return '';
+
   const availableTools = [
     ASK_USER_TOOL,
     ...tools.filter(tool => tool?.function?.name !== ASK_USER_TOOL.function.name),
@@ -146,7 +152,7 @@ function buildToolsPrompt(tools = []) {
       prompt += `工具名称: ${fn.name}\n`;
       prompt += `工具描述: ${fn.description || ''}\n`;
       if (fn.parameters && fn.parameters.properties) {
-        prompt += `参数格式 (JSON Schema):\n${JSON.stringify(fn.parameters, null, 2)}\n`;
+        prompt += `参数格式 (JSON Schema):\n${JSON.stringify(fn.parameters)}\n`;
       }
       prompt += '\n';
     }
@@ -314,6 +320,57 @@ function cleanupTempDir(dir) {
   }
 }
 
+// The Claude CLI keeps its own on-disk conversation history keyed by session
+// id (see --resume). Rebuilding and resending the full flattened history on
+// every turn (the original approach) throws that away and pays full input
+// tokens for the whole conversation each time. Instead we remember, per
+// request, a hash of "the messages array the client should send next" mapped
+// to the CLI session that already has that history - so the following turn
+// only needs to send its new content via --resume.
+//
+// This is a pure optimization: any cache miss (first turn, stale/evicted
+// session, non-standard client behavior) just falls back to the original
+// full-rebuild behavior, so it can never make a request fail that would
+// otherwise have succeeded.
+const MAX_SESSIONS = 200;
+const SESSION_TTL_MS = 6 * 60 * 60 * 1000;
+const sessionStore = new Map(); // hash(prefix) -> { sessionId, lastUsed }
+const sessionsInFlight = new Set(); // sessionId currently mid-request
+
+function hashMessages(msgs) {
+  return crypto.createHash('sha256').update(JSON.stringify(msgs)).digest('hex');
+}
+
+function pruneSessionStore() {
+  const now = Date.now();
+  for (const [key, value] of sessionStore) {
+    if (now - value.lastUsed > SESSION_TTL_MS) sessionStore.delete(key);
+  }
+  while (sessionStore.size > MAX_SESSIONS) {
+    const oldestKey = sessionStore.keys().next().value;
+    sessionStore.delete(oldestKey);
+  }
+}
+
+function rememberSession(priorMessages, assistantMessage, sessionId) {
+  const key = hashMessages([...priorMessages, assistantMessage]);
+  sessionStore.set(key, { sessionId, lastUsed: Date.now() });
+  pruneSessionStore();
+}
+
+function findResumableSession(messages) {
+  if (messages.length < 2) return null;
+  const lastMessage = messages[messages.length - 1];
+  if (lastMessage.role !== 'user' && lastMessage.role !== 'tool') return null;
+
+  const prefixMessages = messages.slice(0, -1);
+  const prefixKey = hashMessages(prefixMessages);
+  const hit = sessionStore.get(prefixKey);
+  if (!hit || sessionsInFlight.has(hit.sessionId)) return null;
+
+  return { prefixKey, sessionId: hit.sessionId, lastMessage };
+}
+
 // Spawns the Claude CLI and turns its stream-json stdout into a small set of
 // events, shared by both the streaming and non-streaming response paths.
 //
@@ -333,6 +390,8 @@ function runClaudeCli(args, prompt) {
     completionTokens: 0,
     stopReason: 'stop',
     stderr: '',
+    isError: false,
+    errorMessage: '',
   };
 
   let buffer = '';
@@ -389,6 +448,15 @@ function runClaudeCli(args, prompt) {
           state.promptTokens = parsed.usage.input_tokens || state.promptTokens;
           state.completionTokens = parsed.usage.output_tokens || state.completionTokens;
         }
+        // The CLI can report a logical failure (e.g. "No conversation found
+        // with session ID: ...") with exit code 0, so this has to be tracked
+        // independently of the process exit code.
+        if (parsed.is_error) {
+          state.isError = true;
+          state.errorMessage = Array.isArray(parsed.errors) && parsed.errors.length
+            ? parsed.errors.join('; ')
+            : (typeof parsed.result === 'string' ? parsed.result : 'CLI reported an error');
+        }
       }
 
       if (parsed.type === 'error') {
@@ -429,6 +497,86 @@ function runClaudeCli(args, prompt) {
   return emitter;
 }
 
+// Wraps runClaudeCli to make --resume attempts safe: if a resumed session
+// turns out to be stale (evicted on the CLI's side, e.g. after a restart or
+// disk cleanup) it fails immediately with zero output, before any content
+// has been streamed to the client. In that case - and only in that case -
+// we transparently retry once with a freshly rebuilt full-history turn.
+// Once any text has been emitted we're committed: a later failure is just a
+// real error, since we can no longer discard what the client already saw.
+//
+// `resume` is `{ args, prompt, prefixKey, sessionId } | null`.
+// `buildFreshTurn()` lazily builds the full-rebuild `{ args, prompt, sessionId }`
+// turn, so it only pays that cost when actually needed.
+function runClaudeCliWithFallback({ resume, buildFreshTurn }) {
+  const emitter = new EventEmitter();
+  emitter.kill = () => {};
+
+  const attach = (cli, { isResumeAttempt, sessionIdUsed, prefixKey, tempDir }) => {
+    let sawText = false;
+    emitter.kill = () => cli.kill();
+
+    const retryFresh = () => {
+      if (isResumeAttempt) {
+        sessionStore.delete(prefixKey);
+        sessionsInFlight.delete(sessionIdUsed);
+      }
+      const fresh = buildFreshTurn();
+      attach(runClaudeCli(fresh.args, fresh.prompt), {
+        isResumeAttempt: false,
+        sessionIdUsed: fresh.sessionId,
+        tempDir: fresh.tempDir,
+      });
+    };
+
+    cli.on('text', (delta) => {
+      sawText = true;
+      emitter.emit('text', delta);
+    });
+
+    cli.on('stop', (state) => emitter.emit('stop', { ...state, sessionId: sessionIdUsed }));
+
+    cli.on('spawn-error', (error) => {
+      cleanupTempDir(tempDir);
+      emitter.emit('spawn-error', error);
+    });
+
+    cli.on('cli-error', (message) => {
+      if (isResumeAttempt && !sawText) {
+        cleanupTempDir(tempDir);
+        return retryFresh();
+      }
+      emitter.emit('cli-error', message);
+    });
+
+    cli.on('close', ({ code, timedOut, state }) => {
+      cleanupTempDir(tempDir);
+      if (isResumeAttempt) sessionsInFlight.delete(sessionIdUsed);
+      if (isResumeAttempt && !sawText && state.isError && !timedOut) return retryFresh();
+      emitter.emit('close', { code, timedOut, state, sessionId: sessionIdUsed });
+    });
+  };
+
+  if (resume) {
+    sessionsInFlight.add(resume.sessionId);
+    attach(runClaudeCli(resume.args, resume.prompt), {
+      isResumeAttempt: true,
+      sessionIdUsed: resume.sessionId,
+      prefixKey: resume.prefixKey,
+      tempDir: resume.tempDir,
+    });
+  } else {
+    const fresh = buildFreshTurn();
+    attach(runClaudeCli(fresh.args, fresh.prompt), {
+      isResumeAttempt: false,
+      sessionIdUsed: fresh.sessionId,
+      tempDir: fresh.tempDir,
+    });
+  }
+
+  return emitter;
+}
+
 app.get('/v1/models', (req, res) => {
   res.json({
     object: 'list',
@@ -436,61 +584,120 @@ app.get('/v1/models', (req, res) => {
   });
 });
 
+// Single user message or a run of trailing tool-result messages, described
+// the same way buildPrompt would describe them, but without the
+// "Human:/Assistant:" multi-turn framing - `--resume` only expects the new
+// turn's content, not a rebuilt transcript.
+function describeUserMessageWithImages(message, images) {
+  const textContent = contentToString(message.content);
+  if (!Array.isArray(message.content) || images.length === 0) return textContent;
+  const imgDescs = images.map((img, i) => `[图片 ${i + 1}: 请读取文件 ${img.path}]`);
+  return imgDescs.join('\n') + '\n\n' + textContent;
+}
+
 app.post('/v1/chat/completions', validateChatRequest, async (req, res) => {
-  let tempDir;
+  let currentTempDir = null;
   try {
-    const { messages, model, stream = false, temperature, max_tokens, tools } = req.body;
-
-    const baseSystemPrompt = extractSystemPrompt(messages) || '';
-    const toolsPrompt = buildToolsPrompt(tools || []);
-    const toolResults = extractToolResults(messages);
-    const toolResultPrompt = buildToolResultPrompt(toolResults);
-
-    let systemPromptParts = [];
-    if (baseSystemPrompt) systemPromptParts.push(baseSystemPrompt);
-    if (toolsPrompt) systemPromptParts.push(toolsPrompt);
-    const systemPrompt = systemPromptParts.length > 0 ? systemPromptParts.join('\n\n') : undefined;
-
-    const { images, tempDir: dir } = extractAndSaveImages(messages);
-    tempDir = dir;
-    const hasImages = images.length > 0;
-
-    const conversationMessages = messages.filter(m => m.role === 'user' || m.role === 'assistant');
-    let prompt = buildPrompt(conversationMessages, images);
-
-    if (toolResultPrompt) {
-      prompt = prompt.replace(/Assistant: $/, '') + `Human: ${toolResultPrompt}\n\nAssistant: `;
-    }
-
+    const { messages, model, stream = false, tools } = req.body;
     const cliModel = mapModel(model);
-    const args = ['-p', '--safe-mode', '--model', cliModel];
 
-    if (hasImages) {
-      args.push('--tools', 'Read');
-      args.push('--allowedTools', 'Read');
-      args.push('--add-dir', tempDir);
-    } else {
-      args.push('--tools', '');
+    const computeSystemPrompt = () => {
+      const baseSystemPrompt = extractSystemPrompt(messages) || '';
+      const toolsPrompt = buildToolsPrompt(tools || []);
+      const parts = [];
+      if (baseSystemPrompt) parts.push(baseSystemPrompt);
+      if (toolsPrompt) parts.push(toolsPrompt);
+      // Never leave this unset: without --system-prompt-file the CLI falls
+      // back to its own (much longer) default Claude Code system prompt,
+      // which costs more tokens than this whole request would otherwise.
+      return parts.length > 0 ? parts.join('\n\n') : DEFAULT_SYSTEM_PROMPT;
+    };
+
+    const buildCliArgs = ({ hasImages, tempDir, systemPrompt, sessionFlag }) => {
+      const args = ['-p', '--safe-mode', '--model', cliModel, ...sessionFlag];
+
+      if (hasImages) {
+        args.push('--tools', 'Read');
+        args.push('--allowedTools', 'Read');
+        args.push('--add-dir', tempDir);
+      } else {
+        args.push('--tools', '');
+      }
+
+      if (systemPrompt) {
+        // Passed via a file rather than argv: tool schemas can make this
+        // large enough to risk hitting the OS's argv size limit (E2BIG).
+        const systemPromptPath = path.join(tempDir, 'system-prompt.txt');
+        fs.writeFileSync(systemPromptPath, systemPrompt);
+        args.push('--system-prompt-file', systemPromptPath);
+      }
+
+      args.push('--output-format', 'stream-json');
+      args.push('--include-partial-messages');
+      args.push('--verbose');
+      return args;
+    };
+
+    // Full-rebuild turn: flattens the entire message history into one prompt
+    // and starts a brand new CLI session. Used for the first turn of a
+    // conversation, and as the fallback if a --resume attempt turns out to
+    // be stale.
+    const buildFreshTurn = () => {
+      const systemPrompt = computeSystemPrompt();
+      const { images, tempDir } = extractAndSaveImages(messages);
+      currentTempDir = tempDir;
+      const hasImages = images.length > 0;
+
+      const conversationMessages = messages.filter(m => m.role === 'user' || m.role === 'assistant');
+      let prompt = buildPrompt(conversationMessages, images);
+
+      const toolResultPrompt = buildToolResultPrompt(extractToolResults(messages));
+      if (toolResultPrompt) {
+        prompt = prompt.replace(/Assistant: $/, '') + `Human: ${toolResultPrompt}\n\nAssistant: `;
+      }
+
+      const sessionId = crypto.randomUUID();
+      const args = buildCliArgs({ hasImages, tempDir, systemPrompt, sessionFlag: ['--session-id', sessionId] });
+      return { args, prompt, sessionId, tempDir };
+    };
+
+    // Incremental turn: the CLI already has this conversation's history under
+    // `sessionId` (see sessionStore/findResumableSession), so only the new
+    // trailing message(s) need to be sent.
+    let resume = null;
+    const resumeCandidate = findResumableSession(messages);
+    if (resumeCandidate) {
+      const { prefixKey, sessionId, lastMessage } = resumeCandidate;
+      const systemPrompt = computeSystemPrompt();
+
+      let scopedMessages;
+      if (lastMessage.role === 'tool') {
+        scopedMessages = [];
+        for (let i = messages.length - 1; i >= 0 && messages[i].role === 'tool'; i--) {
+          scopedMessages.unshift(messages[i]);
+        }
+      } else {
+        scopedMessages = [lastMessage];
+      }
+
+      const { images, tempDir } = extractAndSaveImages(scopedMessages);
+      currentTempDir = tempDir;
+      const hasImages = images.length > 0;
+
+      const prompt = lastMessage.role === 'tool'
+        ? buildToolResultPrompt(extractToolResults(scopedMessages))
+        : describeUserMessageWithImages(lastMessage, images);
+
+      const args = buildCliArgs({ hasImages, tempDir, systemPrompt, sessionFlag: ['--resume', sessionId] });
+      resume = { args, prompt, prefixKey, sessionId, tempDir };
     }
-
-    if (systemPrompt) {
-      // Passed via a file rather than argv: tool schemas can make this large
-      // enough to risk hitting the OS's argv size limit (E2BIG).
-      const systemPromptPath = path.join(tempDir, 'system-prompt.txt');
-      fs.writeFileSync(systemPromptPath, systemPrompt);
-      args.push('--system-prompt-file', systemPromptPath);
-    }
-
-    args.push('--output-format', 'stream-json');
-    args.push('--include-partial-messages');
-    args.push('--verbose');
 
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
 
-      const cli = runClaudeCli(args, prompt);
+      const cli = runClaudeCliWithFallback({ resume, buildFreshTurn });
       const responseId = 'chatcmpl-' + Date.now();
       let disconnected = false;
       let streamFinished = false;
@@ -548,7 +755,7 @@ app.post('/v1/chat/completions', validateChatRequest, async (req, res) => {
         pending = '';
       });
 
-      const finish = ({ fullText, promptTokens, completionTokens }) => {
+      const finish = ({ fullText, promptTokens, completionTokens, sessionId }) => {
         if (streamFinished || res.writableEnded) return;
         streamFinished = true;
 
@@ -572,6 +779,10 @@ app.post('/v1/chat/completions', validateChatRequest, async (req, res) => {
         });
         res.write('data: [DONE]\n\n');
         res.end();
+
+        const assistantMessage = { role: 'assistant', content: cleanText || null };
+        if (toolCalls.length) assistantMessage.tool_calls = toolCalls;
+        rememberSession(messages, assistantMessage, sessionId);
       };
 
       cli.on('stop', (state) => finish(state));
@@ -584,7 +795,6 @@ app.post('/v1/chat/completions', validateChatRequest, async (req, res) => {
       });
 
       cli.on('spawn-error', (error) => {
-        cleanupTempDir(tempDir);
         if (streamFinished || res.writableEnded) return;
         streamFinished = true;
         console.error('Failed to start Claude CLI:', error);
@@ -595,13 +805,12 @@ app.post('/v1/chat/completions', validateChatRequest, async (req, res) => {
       });
 
       cli.on('close', ({ code, timedOut, state }) => {
-        cleanupTempDir(tempDir);
         if (streamFinished || res.writableEnded) return;
-        if (code !== 0 && !state.fullText) {
+        if ((code !== 0 || state.isError) && !state.fullText) {
           streamFinished = true;
           const message = timedOut
             ? `CLI process timed out after ${CLI_TIMEOUT_MS}ms`
-            : `CLI process exited with code ${code}`;
+            : (state.errorMessage || `CLI process exited with code ${code}`);
           console.error(message);
           res.write(`data: ${JSON.stringify({ error: { message, type: 'api_error' } })}\n\n`);
           res.end();
@@ -611,7 +820,7 @@ app.post('/v1/chat/completions', validateChatRequest, async (req, res) => {
       });
 
     } else {
-      const cli = runClaudeCli(args, prompt);
+      const cli = runClaudeCliWithFallback({ resume, buildFreshTurn });
       let responded = false;
 
       res.on('close', () => {
@@ -629,19 +838,17 @@ app.post('/v1/chat/completions', validateChatRequest, async (req, res) => {
       });
 
       cli.on('spawn-error', (error) => {
-        cleanupTempDir(tempDir);
         console.error('Failed to start Claude CLI:', error);
         respondError(500, `Failed to start Claude CLI: ${error.message}`);
       });
 
-      cli.on('close', ({ code, timedOut, state }) => {
-        cleanupTempDir(tempDir);
+      cli.on('close', ({ code, timedOut, state, sessionId }) => {
         if (responded) return;
 
-        if (code !== 0 && !state.fullText) {
+        if ((code !== 0 || state.isError) && !state.fullText) {
           const message = timedOut
             ? `CLI process timed out after ${CLI_TIMEOUT_MS}ms`
-            : (state.stderr || `CLI exited with code ${code}`);
+            : (state.errorMessage || state.stderr || `CLI exited with code ${code}`);
           console.error('CLI exited with code', code, 'stderr:', state.stderr);
           return respondError(500, message);
         }
@@ -660,6 +867,7 @@ app.post('/v1/chat/completions', validateChatRequest, async (req, res) => {
         }
 
         responded = true;
+        rememberSession(messages, message, sessionId);
         res.json({
           id: 'chatcmpl-' + Date.now(),
           object: 'chat.completion',
@@ -675,7 +883,7 @@ app.post('/v1/chat/completions', validateChatRequest, async (req, res) => {
       });
     }
   } catch (error) {
-    cleanupTempDir(tempDir);
+    cleanupTempDir(currentTempDir);
     console.error('Error:', error);
     if (!res.headersSent) {
       res.status(500).json({

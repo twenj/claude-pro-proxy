@@ -21,6 +21,11 @@ The CLI mode uses the local Claude login. OpenAI tool calls are emulated through
 
 With `stream: true`, plain-text replies are forwarded to the client as they arrive. A reply is held back and buffered only while it still looks like it could turn into a ` ```json {"tool_calls": ...} ``` ` block, so structured tool calls are never leaked to the client as partial JSON.
 
+### Token usage
+
+- The tool-calling instructions (including the `ask_user_question` affordance) are only added to the system prompt when the request actually includes `tools`; plain chat requests never pay for that boilerplate.
+- If a request's `messages` array is exactly the previous response's messages plus one new turn, the proxy resumes the underlying Claude CLI session (`--resume`) and only sends the new turn, instead of re-sending the full conversation history every time. This falls back transparently to a full rebuild whenever that isn't possible (first turn, edited history, an expired/evicted session, etc.), so it's a pure optimization and never a source of failures.
+
 ### User clarification tool
 
 CLI mode exposes a proxy-level OpenAI function named `ask_user_question`. When Claude needs a blocking choice, the response has `finish_reason: "tool_calls"` and arguments shaped like:
