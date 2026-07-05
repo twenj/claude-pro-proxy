@@ -728,9 +728,15 @@ app.post('/v1/chat/completions', validateChatRequest, async (req, res) => {
       };
 
       // Text can only be forwarded live once we're confident it isn't the
-      // start of a ```json tool-call block (see classifyResponsePrefix).
-      // Until that's decided, deltas are held in `pending` instead of sent.
-      let mode = 'undecided';
+      // start of a ```json tool-call block (see classifyResponsePrefix). But
+      // that check only looks at the first few characters - if the model
+      // prepends any preamble before the block, the prefix looks like plain
+      // text and the block would stream through as literal visible content
+      // instead of becoming a tool call. The only case where a tool-call
+      // block can appear at all is when tools were offered (that's the only
+      // time the tool-calling instructions are in the system prompt at all -
+      // see buildToolsPrompt), so passthrough is only safe when there are none.
+      let mode = (tools && tools.length) ? 'buffering' : 'undecided';
       let pending = '';
 
       cli.on('text', (delta) => {
