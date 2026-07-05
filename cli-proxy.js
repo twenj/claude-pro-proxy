@@ -257,17 +257,35 @@ function extractToolResults(messages) {
   return results;
 }
 
+const TOOL_RESULT_PROMPT_MARKER = '以下是工具调用的原始返回数据（仅供你分析参考，不是你的回复内容）：';
+const TOOL_RESULT_PROMPT_TAIL = '现在请直接回答用户最初的问题。只输出你的分析结论，绝对不要把上面的原始数据或文件内容复制、转述或引用到你的回复中。如果还需要调用其他工具，请严格用 ```json 代码块格式输出 tool_calls；否则请直接用自然语言给出最终回答。';
+
 function buildToolResultPrompt(toolResults) {
   if (toolResults.length === 0) return '';
 
-  let prompt = '以下是工具调用的返回结果：\n\n';
+  let prompt = `${TOOL_RESULT_PROMPT_MARKER}\n\n`;
   for (const result of toolResults) {
     prompt += `--- 工具调用 ID: ${result.tool_call_id} ---\n`;
     prompt += `${result.content}\n`;
     prompt += `--- 工具结果结束 ---\n\n`;
   }
-  prompt += '请根据以上工具返回结果继续完成任务。不要重复输出工具结果。如果还需要调用其他工具，请严格用 ```json 代码块格式输出 tool_calls。';
+  prompt += TOOL_RESULT_PROMPT_TAIL;
   return prompt;
+}
+
+// Defense in depth: the instruction above sometimes isn't followed and the
+// model echoes the whole recap block back verbatim instead of answering
+// (this is our own fixed template, not user content, so an exact match is
+// safe). If that happens, strip it out rather than showing the raw dump to
+// the client.
+function stripEchoedToolResultPrompt(text) {
+  if (!text || typeof text !== 'string' || !text.includes(TOOL_RESULT_PROMPT_MARKER)) return text;
+
+  const markerIndex = text.indexOf(TOOL_RESULT_PROMPT_MARKER);
+  const tailIndex = text.indexOf(TOOL_RESULT_PROMPT_TAIL);
+  const before = text.slice(0, markerIndex);
+  const after = tailIndex === -1 ? '' : text.slice(tailIndex + TOOL_RESULT_PROMPT_TAIL.length);
+  return (before + after).trim();
 }
 
 function extractAndSaveImages(messages) {
@@ -766,8 +784,10 @@ app.post('/v1/chat/completions', validateChatRequest, async (req, res) => {
         streamFinished = true;
 
         // If we were already streaming plain text live, it's all been sent -
-        // re-sending the accumulated fullText here would duplicate it.
-        const rawText = fullText || '';
+        // re-sending the accumulated fullText here would duplicate it. Live
+        // streaming only ever happens for tool-less requests (see `mode`
+        // above), so there's no tool-result recap to echo in that case.
+        const rawText = mode === 'passthrough' ? (fullText || '') : stripEchoedToolResultPrompt(fullText || '');
         const toolCalls = mode === 'passthrough' ? [] : extractToolCalls(rawText);
         const cleanText = toolCalls.length ? stripToolCallBlocks(rawText) : rawText;
 
@@ -859,7 +879,7 @@ app.post('/v1/chat/completions', validateChatRequest, async (req, res) => {
           return respondError(500, message);
         }
 
-        const rawText = state.fullText || '';
+        const rawText = stripEchoedToolResultPrompt(state.fullText || '');
         const toolCalls = extractToolCalls(rawText);
 
         let message;
