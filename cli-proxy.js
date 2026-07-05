@@ -5,14 +5,23 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const {
+  DEFAULT_BODY_LIMIT,
+  authenticate,
+  corsOptions,
+  installErrorHandler,
+  validateChatRequest,
+} = require('./proxy-common');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'claude-pro';
+const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'claude-sonnet-4-6';
+const CLAUDE_BIN = process.env.CLAUDE_BIN || path.join(os.homedir(), '.local', 'bin', 'claude');
 
-app.use(cors());
-app.use(express.json({ limit: '100mb' }));
-app.use(express.urlencoded({ limit: '100mb', extended: true }));
+app.use(cors(corsOptions()));
+app.use(express.json({ limit: DEFAULT_BODY_LIMIT }));
+app.use(express.urlencoded({ limit: DEFAULT_BODY_LIMIT, extended: true }));
+app.use(authenticate);
 
 const AVAILABLE_MODELS = [
   { id: 'claude-fable-5', object: 'model', created: 1718000000, owned_by: 'anthropic' },
@@ -127,31 +136,52 @@ function buildToolsPrompt(tools) {
 
 function extractToolCalls(text) {
   const toolCalls = [];
+  if (!text || typeof text !== 'string') return toolCalls;
 
-  const codeBlockMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  let jsonStr = text;
-  if (codeBlockMatch) {
-    jsonStr = codeBlockMatch[1].trim();
+  const tryParseToolCalls = (jsonStr) => {
+    try {
+      const parsed = JSON.parse(jsonStr);
+      if (parsed.tool_calls && Array.isArray(parsed.tool_calls)) {
+        for (const tc of parsed.tool_calls) {
+          toolCalls.push({
+            id: tc.id || `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+            type: 'function',
+            function: {
+              name: tc.name || '',
+              arguments: typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments || {}),
+            },
+          });
+        }
+        return true;
+      }
+    } catch (e) {
+    }
+    return false;
+  };
+
+  const codeBlockRegex = /```(?:json)?\s*([\s\S]*?)```/gi;
+  let match;
+  while ((match = codeBlockRegex.exec(text)) !== null) {
+    const codeContent = match[1].trim();
+    if (tryParseToolCalls(codeContent)) {
+      return toolCalls;
+    }
   }
 
-  try {
-    const parsed = JSON.parse(jsonStr);
-    if (parsed.tool_calls && Array.isArray(parsed.tool_calls)) {
-      for (const tc of parsed.tool_calls) {
-        toolCalls.push({
-          id: tc.id || `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-          type: 'function',
-          function: {
-            name: tc.name || '',
-            arguments: typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments || {}),
-          },
-        });
-      }
-    }
-  } catch (e) {
+  const trimmed = text.trim();
+  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+    tryParseToolCalls(trimmed);
   }
 
   return toolCalls;
+}
+
+function stripToolCallBlocks(text) {
+  if (!text || typeof text !== 'string') return text;
+  let result = text;
+  result = result.replace(/```(?:json)?\s*\{\s*"tool_calls"[\s\S]*?\}\s*```/gi, '');
+  result = result.replace(/^\s*\{\s*"tool_calls"[\s\S]*?\}\s*$/gi, '');
+  return result.trim();
 }
 
 function extractToolResults(messages) {
@@ -172,10 +202,11 @@ function buildToolResultPrompt(toolResults) {
 
   let prompt = '以下是工具调用的返回结果：\n\n';
   for (const result of toolResults) {
-    prompt += `工具调用 ID: ${result.tool_call_id}\n`;
-    prompt += `返回结果:\n${result.content}\n\n`;
+    prompt += `--- 工具调用 ID: ${result.tool_call_id} ---\n`;
+    prompt += `${result.content}\n`;
+    prompt += `--- 工具结果结束 ---\n\n`;
   }
-  prompt += '请根据工具返回结果继续完成任务。如果还需要调用其他工具，请继续用 JSON 格式输出工具调用。';
+  prompt += '请根据以上工具返回结果继续完成任务。不要重复输出工具结果。如果还需要调用其他工具，请严格用 ```json 代码块格式输出 tool_calls。';
   return prompt;
 }
 
@@ -236,7 +267,7 @@ app.get('/v1/models', (req, res) => {
   });
 });
 
-app.post('/v1/chat/completions', async (req, res) => {
+app.post('/v1/chat/completions', validateChatRequest, async (req, res) => {
   try {
     const { messages, model, stream = false, temperature, max_tokens, tools } = req.body;
 
@@ -267,10 +298,10 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     if (hasImages) {
       args.push('--tools', 'Read');
+      args.push('--allowedTools', 'Read');
       args.push('--add-dir', tempDir);
-      args.push('--dangerously-skip-permissions');
-    } else if (hasExternalTools) {
-      args.push('--tools=');
+    } else {
+      args.push('--tools', '');
     }
 
     if (systemPrompt) {
@@ -286,7 +317,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
 
-      const child = spawn('claude', args, {
+      const child = spawn(CLAUDE_BIN, args, {
         stdio: ['pipe', 'pipe', 'pipe'],
       });
 
@@ -295,6 +326,55 @@ app.post('/v1/chat/completions', async (req, res) => {
       let promptTokens = 0;
       let completionTokens = 0;
       let totalCost = 0;
+      let streamFinished = false;
+
+      res.on('close', () => {
+        if (!res.writableEnded && child.exitCode === null) child.kill('SIGTERM');
+      });
+
+      const finishStream = () => {
+        if (streamFinished || res.writableEnded) return;
+        streamFinished = true;
+
+        const rawText = fullText || '';
+        const toolCalls = hasExternalTools ? extractToolCalls(rawText) : [];
+        const cleanText = toolCalls.length ? stripToolCallBlocks(rawText) : rawText;
+        const delta = { role: 'assistant' };
+
+        if (cleanText) delta.content = cleanText;
+        if (toolCalls.length) {
+          delta.tool_calls = toolCalls.map((call, index) => ({ index, ...call }));
+        }
+
+        if (cleanText || toolCalls.length) {
+          res.write(`data: ${JSON.stringify({
+            id: 'chatcmpl-' + Date.now(),
+            object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000),
+            model: cliModel,
+            choices: [{ index: 0, delta, finish_reason: null }],
+          })}\n\n`);
+        }
+
+        res.write(`data: ${JSON.stringify({
+          id: 'chatcmpl-' + Date.now(),
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model: cliModel,
+          choices: [{
+            index: 0,
+            delta: {},
+            finish_reason: toolCalls.length ? 'tool_calls' : 'stop',
+          }],
+          usage: {
+            prompt_tokens: promptTokens,
+            completion_tokens: completionTokens,
+            total_tokens: promptTokens + completionTokens,
+          },
+        })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      };
 
       child.stdout.on('data', (data) => {
         buffer += data.toString();
@@ -321,23 +401,6 @@ app.post('/v1/chat/completions', async (req, res) => {
 
                 if (text) {
                   fullText += text;
-                  const chunk = {
-                    id: 'chatcmpl-' + Date.now(),
-                    object: 'chat.completion.chunk',
-                    created: Math.floor(Date.now() / 1000),
-                    model: cliModel,
-                    choices: [
-                      {
-                        index: 0,
-                        delta: { content: text },
-                        finish_reason: null,
-                      },
-                    ],
-                  };
-                  const chunkStr = `data: ${JSON.stringify(chunk)}\n\n`;
-                  if (typeof chunkStr === 'string') {
-                    res.write(chunkStr);
-                  }
                 }
               }
 
@@ -350,30 +413,7 @@ app.post('/v1/chat/completions', async (req, res) => {
               }
 
               if (event.type === 'message_stop') {
-                const finalChunk = {
-                  id: 'chatcmpl-' + Date.now(),
-                  object: 'chat.completion.chunk',
-                  created: Math.floor(Date.now() / 1000),
-                  model: cliModel,
-                  choices: [
-                    {
-                      index: 0,
-                      delta: {},
-                      finish_reason: 'stop',
-                    },
-                  ],
-                  usage: {
-                    prompt_tokens: promptTokens,
-                    completion_tokens: completionTokens,
-                    total_tokens: promptTokens + completionTokens,
-                  },
-                };
-                const finalStr = `data: ${JSON.stringify(finalChunk)}\n\n`;
-                if (typeof finalStr === 'string') {
-                  res.write(finalStr);
-                }
-                res.write('data: [DONE]\n\n');
-                res.end();
+                finishStream();
               }
             }
 
@@ -422,9 +462,23 @@ app.post('/v1/chat/completions', async (req, res) => {
         console.error('CLI stderr:', data.toString());
       });
 
+      child.on('error', (error) => {
+        cleanupTempDir(tempDir);
+        if (res.writableEnded) return;
+        streamFinished = true;
+        console.error('Failed to start Claude CLI:', error);
+        res.write(`data: ${JSON.stringify({
+          error: {
+            message: `Failed to start Claude CLI: ${error.message}`,
+            type: 'api_error',
+          },
+        })}\n\n`);
+        res.end();
+      });
+
       child.on('close', (code) => {
         cleanupTempDir(tempDir);
-        if (code !== 0 && !res.writableEnded) {
+        if (code !== 0 && !res.writableEnded && !fullText) {
           console.error(`CLI process exited with code ${code}`);
           const errorChunk = {
             error: {
@@ -435,8 +489,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           res.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
           res.end();
         } else if (!res.writableEnded) {
-          res.write('data: [DONE]\n\n');
-          res.end();
+          finishStream();
         }
       });
 
@@ -444,7 +497,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       child.stdin.end();
 
     } else {
-      const child = spawn('claude', args, {
+      const child = spawn(CLAUDE_BIN, args, {
         stdio: ['pipe', 'pipe', 'pipe'],
       });
 
@@ -455,6 +508,10 @@ app.post('/v1/chat/completions', async (req, res) => {
       let totalCost = 0;
       let stopReason = 'stop';
       let stderr = '';
+
+      res.on('close', () => {
+        if (!res.writableEnded && child.exitCode === null) child.kill('SIGTERM');
+      });
 
       child.stdout.on('data', (data) => {
         buffer += data.toString();
@@ -520,12 +577,24 @@ app.post('/v1/chat/completions', async (req, res) => {
         console.error('CLI stderr:', data.toString());
       });
 
+      child.on('error', (error) => {
+        cleanupTempDir(tempDir);
+        if (res.headersSent) return res.end();
+        console.error('Failed to start Claude CLI:', error);
+        res.status(500).json({
+          error: {
+            message: `Failed to start Claude CLI: ${error.message}`,
+            type: 'api_error',
+          },
+        });
+      });
+
       child.stdin.write(prompt);
       child.stdin.end();
 
       child.on('close', (code) => {
         cleanupTempDir(tempDir);
-        if (code !== 0) {
+        if (code !== 0 && !fullText) {
           console.error('CLI exited with code', code, 'stderr:', stderr);
           return res.status(500).json({
             error: {
@@ -536,23 +605,24 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
 
         try {
-          const answerText = fullText || '';
-          const toolCalls = hasExternalTools ? extractToolCalls(answerText) : [];
+          const rawText = fullText || '';
+          const toolCalls = hasExternalTools ? extractToolCalls(rawText) : [];
 
           let message;
           let finishReason;
 
           if (toolCalls.length > 0) {
+            const cleanText = stripToolCallBlocks(rawText);
             message = {
               role: 'assistant',
-              content: null,
+              content: cleanText || null,
               tool_calls: toolCalls,
             };
             finishReason = 'tool_calls';
           } else {
             message = {
               role: 'assistant',
-              content: answerText,
+              content: rawText,
             };
             finishReason = stopReason;
           }
@@ -602,6 +672,8 @@ app.post('/v1/chat/completions', async (req, res) => {
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', message: 'Claude CLI proxy is running', default_model: DEFAULT_MODEL, available_models: AVAILABLE_MODELS.map(model => model.id) });
 });
+
+installErrorHandler(app);
 
 app.listen(PORT, () => {
   console.log(`Claude CLI proxy server running on http://localhost:${PORT}`);
